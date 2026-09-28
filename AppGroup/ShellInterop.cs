@@ -180,6 +180,61 @@ namespace AppGroup {
             }
         }
 
+        /// <summary>
+        /// Reads the target path of a shortcut safely (both standard filesystem paths and virtual shell:AppsFolder targets).
+        /// </summary>
+        public static string? GetShortcutTarget(string lnkPath) {
+            if (string.IsNullOrWhiteSpace(lnkPath) || !File.Exists(lnkPath)) return null;
+            try {
+                var shellLink = (IShellLinkW)new CShellLink();
+                var persistFile = (IPersistFile)shellLink;
+                persistFile.Load(lnkPath, 0);
+
+                // Check arguments first: if this shortcut points to explorer.exe shell:AppsFolder\..., return the virtual AppsFolder target!
+                var argsSb = new StringBuilder(2048);
+                shellLink.GetArguments(argsSb, argsSb.Capacity);
+                string args = argsSb.ToString().Trim();
+                if (args.StartsWith("shell:AppsFolder\\", StringComparison.OrdinalIgnoreCase)) {
+                    return args;
+                }
+
+                // 1. Try standard filesystem path
+                var sb = new StringBuilder(1024);
+                shellLink.GetPath(sb, sb.Capacity, IntPtr.Zero, 0);
+                string path = sb.ToString().Trim();
+                if (!string.IsNullOrEmpty(path)) return path;
+
+                // 2. Try IDList for virtual shell targets (e.g. shell:AppsFolder\...)
+                shellLink.GetIDList(out IntPtr pidl);
+                if (pidl != IntPtr.Zero) {
+                    try {
+                        Guid iid = IID_IShellItem;
+                        if (SHCreateItemFromIDList(pidl, ref iid, out object objItem) == 0 && objItem is IShellItem item) {
+                            if (item.GetDisplayName(SIGDN.SIGDN_DESKTOPABSOLUTEPARSING, out IntPtr namePtr) == 0 && namePtr != IntPtr.Zero) {
+                                string virtualPath = Marshal.PtrToStringUni(namePtr);
+                                Marshal.FreeCoTaskMem(namePtr);
+                                if (!string.IsNullOrEmpty(virtualPath)) return virtualPath;
+                            }
+                        }
+                    }
+                    finally {
+                        CoTaskMemFree(pidl);
+                    }
+                }
+
+                // 3. Fallback: check raw bytes for shell:AppsFolder
+                byte[] raw = File.ReadAllBytes(lnkPath);
+                string u = Encoding.Unicode.GetString(raw);
+                int idx = u.IndexOf("shell:AppsFolder\\", StringComparison.OrdinalIgnoreCase);
+                if (idx >= 0) {
+                    int end = u.IndexOf('\0', idx);
+                    return end > idx ? u.Substring(idx, end - idx) : u.Substring(idx);
+                }
+            }
+            catch { }
+            return null;
+        }
+
         // ---- IShellItem / IShellItem2 ----
         public enum SIGDN : uint {
             SIGDN_NORMALDISPLAY = 0x00000000,
@@ -218,13 +273,13 @@ namespace AppGroup {
 
         [ComImport, Guid("7E9FB0D3-919F-4307-AB2E-9B1860310C93"),
          InterfaceType(ComInterfaceType.InterfaceIsIUnknown)]
-        public interface IShellItem2 : IShellItem {
-            new void BindToHandler(IntPtr pbc, [In] ref Guid bhid, [In] ref Guid riid, out IntPtr ppv);
-            new void GetParent(out IShellItem ppsi);
+        public interface IShellItem2 {
+            void BindToHandler(IntPtr pbc, [In] ref Guid bhid, [In] ref Guid riid, out IntPtr ppv);
+            void GetParent(out IShellItem ppsi);
             [PreserveSig]
-            new int GetDisplayName(SIGDN sigdnName, out IntPtr ppszName);
-            new void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
-            new void Compare(IShellItem psi, uint hint, out int piOrder);
+            int GetDisplayName(SIGDN sigdnName, out IntPtr ppszName);
+            void GetAttributes(uint sfgaoMask, out uint psfgaoAttribs);
+            void Compare(IShellItem psi, uint hint, out int piOrder);
 
             void GetPropertyStore_Placeholder();
             void GetPropertyStoreWithCreateObject_Placeholder();
@@ -346,8 +401,9 @@ namespace AppGroup {
                         if (shellItem != null) {
                             int hrName = shellItem.GetDisplayName(SIGDN.SIGDN_NORMALDISPLAY, out IntPtr namePtr);
                             if (hrName == 0 && namePtr != IntPtr.Zero) {
-                                resolved.DisplayName = NormalizeAppName(Marshal.PtrToStringUni(namePtr));
+                                string rawName = Marshal.PtrToStringUni(namePtr);
                                 Marshal.FreeCoTaskMem(namePtr);
+                                resolved.DisplayName = rawName;
                             }
                         }
 
@@ -361,7 +417,26 @@ namespace AppGroup {
                             }
                         }
 
-                        // 3. Try reading desktop parsing path (e.g. shell:AppsFolder\... or CLSID for AppsFolder)
+                        // Explicit check: Windows 11 Media Player dragged from Start Menu
+                        if (string.Equals(resolved.DisplayName, "Media Player", StringComparison.OrdinalIgnoreCase) && string.IsNullOrEmpty(resolved.Aumid)) {
+                            resolved.Aumid = "Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic";
+                        }
+
+                        // 3. Try standard file system path first (e.g. desktop/Start Menu shortcuts like Adobe Acrobat.lnk)
+                        if (shellItem != null) {
+                            int hrPath = shellItem.GetDisplayName(SIGDN.SIGDN_FILESYSPATH, out IntPtr pathPtr);
+                            if (hrPath == 0 && pathPtr != IntPtr.Zero) {
+                                string p = Marshal.PtrToStringUni(pathPtr);
+                                Marshal.FreeCoTaskMem(pathPtr);
+                                if (!string.IsNullOrEmpty(p) && (System.IO.File.Exists(p) || System.IO.Directory.Exists(p))) {
+                                    resolved.IsFileSystem = true;
+                                    resolved.Path = p;
+                                    resolved.DisplayName = System.IO.Path.GetFileName(p);
+                                }
+                            }
+                        }
+
+                        // 4. Try reading desktop parsing path (e.g. shell:AppsFolder\... or CLSID for AppsFolder)
                         if (shellItem != null) {
                             int hrParsing = shellItem.GetDisplayName(SIGDN.SIGDN_DESKTOPABSOLUTEPARSING, out IntPtr parsingPtr);
                             if (hrParsing == 0 && parsingPtr != IntPtr.Zero) {
@@ -371,6 +446,7 @@ namespace AppGroup {
                                     if (parsingPath.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase) && (System.IO.File.Exists(parsingPath) || System.IO.Directory.Exists(parsingPath))) {
                                         resolved.IsFileSystem = true;
                                         resolved.Path = parsingPath;
+                                        resolved.DisplayName = System.IO.Path.GetFileName(parsingPath);
                                     }
                                     else if (string.IsNullOrEmpty(resolved.Aumid)) {
                                         if (parsingPath.StartsWith("shell:AppsFolder\\", StringComparison.OrdinalIgnoreCase)) {
@@ -385,7 +461,7 @@ namespace AppGroup {
                             }
                         }
 
-                        // 4. Try reading target parsing path via IShellItem2
+                        // 5. Try reading target parsing path via IShellItem2
                         string? linkTarget = null;
                         if (shellItem2 != null) {
                             var keyTarget = PKEY_Link_TargetParsingPath;
@@ -396,39 +472,38 @@ namespace AppGroup {
                             }
                         }
 
-                        // 5. PRIORITY: Check if this matches a real .lnk in Start Menu (Brave Apps, Chrome Apps, Edge Apps, Programs)
+                        // 6. PRIORITY: Check if this matches a real .lnk in Start Menu (Brave Apps, Chrome Apps, Edge Apps, Programs)
                         bool isPackagedApp = !string.IsNullOrEmpty(resolved.Aumid) &&
                                              (resolved.Aumid.Contains('!') || resolved.Aumid.Contains("_8wekyb3d8bbwe"));
-                        if (!isPackagedApp) {
+                        if (!isPackagedApp && !resolved.IsFileSystem) {
                             string? foundLnk = FindShortcutInStartMenu(resolved.DisplayName, resolved.Aumid);
                             if (!string.IsNullOrEmpty(foundLnk) && System.IO.File.Exists(foundLnk)) {
                                 resolved.IsFileSystem = true;
                                 resolved.Path = foundLnk;
+                                resolved.DisplayName = System.IO.Path.GetFileName(foundLnk);
                                 resolved.Aumid = null;
                                 resolved.ExtractedIconPath = null;
                             }
-                        }
-                        else if (!string.IsNullOrEmpty(linkTarget) && (System.IO.File.Exists(linkTarget) || System.IO.Directory.Exists(linkTarget))) {
-                            bool isBrowserExe = linkTarget.EndsWith("chrome.exe", StringComparison.OrdinalIgnoreCase) ||
-                                               linkTarget.EndsWith("brave.exe", StringComparison.OrdinalIgnoreCase) ||
-                                               linkTarget.EndsWith("msedge.exe", StringComparison.OrdinalIgnoreCase);
-
-                            // Only use direct linkTarget if it is a real .lnk or a standalone non-browser executable
-                            if (linkTarget.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase) || !isBrowserExe) {
-                                resolved.IsFileSystem = true;
-                                resolved.Path = linkTarget;
-                            }
-                        }
-
-                        // 6. Try standard file system path if not yet resolved
-                        if (string.IsNullOrEmpty(resolved.Path) && shellItem != null) {
-                            int hrPath = shellItem.GetDisplayName(SIGDN.SIGDN_FILESYSPATH, out IntPtr pathPtr);
-                            if (hrPath == 0 && pathPtr != IntPtr.Zero) {
-                                string p = Marshal.PtrToStringUni(pathPtr);
-                                Marshal.FreeCoTaskMem(pathPtr);
-                                if (!string.IsNullOrEmpty(p) && (System.IO.File.Exists(p) || System.IO.Directory.Exists(p))) {
+                            else if (!string.IsNullOrEmpty(linkTarget) && (System.IO.File.Exists(linkTarget) || System.IO.Directory.Exists(linkTarget))) {
+                                if (linkTarget.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) {
                                     resolved.IsFileSystem = true;
-                                    resolved.Path = p;
+                                    resolved.Path = linkTarget;
+                                    resolved.DisplayName = System.IO.Path.GetFileName(linkTarget);
+                                }
+                                else {
+                                    bool isBrowserExe = linkTarget.EndsWith("chrome.exe", StringComparison.OrdinalIgnoreCase) ||
+                                                       linkTarget.EndsWith("brave.exe", StringComparison.OrdinalIgnoreCase) ||
+                                                       linkTarget.EndsWith("msedge.exe", StringComparison.OrdinalIgnoreCase);
+
+                                    if (isBrowserExe && !string.IsNullOrEmpty(resolved.Aumid)) {
+                                        // PWA shortcut via AppsFolder
+                                    }
+                                    else {
+                                        string fileShortcut = CreateFileShortcut(linkTarget, resolved.DisplayName);
+                                        resolved.IsFileSystem = true;
+                                        resolved.Path = fileShortcut;
+                                        resolved.DisplayName = System.IO.Path.GetFileName(fileShortcut);
+                                    }
                                 }
                             }
                         }
@@ -441,6 +516,25 @@ namespace AppGroup {
                                 if (!string.IsNullOrEmpty(pwaIcon) && System.IO.File.Exists(pwaIcon)) {
                                     resolved.ExtractedIconPath = pwaIcon;
                                 }
+                            }
+
+                            // 8. If still no icon and this is a packaged modern app, pre-extract full-color icon via IShellItemImageFactory
+                            if (string.IsNullOrEmpty(resolved.ExtractedIconPath)) {
+                                try {
+                                    string outputDir = System.IO.Path.Combine(AppPaths.BaseDataPath, "Icons");
+                                    System.IO.Directory.CreateDirectory(outputDir);
+                                    var bmp = IconHelper.ExtractAppIconViaShellFactory($"shell:AppsFolder\\{resolved.Aumid}", 256);
+                                    if (bmp != null) {
+                                        using (bmp) {
+                                            string safeName = string.Join("_", NormalizeAppName(resolved.DisplayName).Split(System.IO.Path.GetInvalidFileNameChars()));
+                                            if (string.IsNullOrWhiteSpace(safeName)) safeName = "App";
+                                            string iconPath = System.IO.Path.Combine(outputDir, $"{safeName}_{Math.Abs(resolved.Aumid.GetHashCode()):x8}.png");
+                                            bmp.Save(iconPath, System.Drawing.Imaging.ImageFormat.Png);
+                                            resolved.ExtractedIconPath = iconPath;
+                                        }
+                                    }
+                                }
+                                catch { }
                             }
                         }
 
@@ -544,14 +638,11 @@ namespace AppGroup {
             if (clean.StartsWith("_crx_", StringComparison.OrdinalIgnoreCase))
                 clean = clean.Substring(5);
 
-            int lastDelim = Math.Max(clean.LastIndexOf('\\'), clean.LastIndexOf('.'));
-            if (lastDelim >= 0 && lastDelim < clean.Length - 1)
-                clean = clean.Substring(lastDelim + 1);
+            // Strictly require 24 to 32 characters [a-p] for Chromium extension / app IDs
+            if (Regex.IsMatch(clean, @"^[a-pA-P]{24,32}$"))
+                return clean.ToLowerInvariant();
 
-            if (clean.StartsWith("_crx_", StringComparison.OrdinalIgnoreCase))
-                clean = clean.Substring(5);
-
-            return clean.Length >= 8 ? clean.ToLowerInvariant() : null;
+            return null;
         }
 
         /// <summary>
@@ -791,11 +882,34 @@ namespace AppGroup {
                     if (p.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) {
                         string startAppShortcuts = System.IO.Path.Combine(AppPaths.BaseDataPath, "StartAppShortcuts");
                         if (p.StartsWith(startAppShortcuts, StringComparison.OrdinalIgnoreCase)) {
-                            string appName = System.IO.Path.GetFileNameWithoutExtension(p);
-                            string? realLnk = FindShortcutInStartMenu(appName);
-                            if (!string.IsNullOrEmpty(realLnk) && System.IO.File.Exists(realLnk)) {
-                                return realLnk;
+                            // Ensure packaged apps in StartAppShortcuts target explorer.exe with argument shell:AppsFolder\{aumid}
+                            try {
+                                if (TryReadShortcut(p, out string target, out string args, out string ico, out int icoIdx)) {
+                                    if (target.StartsWith("shell:AppsFolder\\", StringComparison.OrdinalIgnoreCase) ||
+                                        (string.IsNullOrEmpty(target) && args.StartsWith("shell:AppsFolder\\", StringComparison.OrdinalIgnoreCase))) {
+                                        string aumid = target.StartsWith("shell:AppsFolder\\", StringComparison.OrdinalIgnoreCase)
+                                            ? target.Substring("shell:AppsFolder\\".Length)
+                                            : args.Substring("shell:AppsFolder\\".Length);
+                                        string explorerExe = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
+                                        SaveShortcut(p, explorerExe, $"shell:AppsFolder\\{aumid}", null, ico);
+                                    }
+                                }
                             }
+                            catch { }
+
+                            string appName = System.IO.Path.GetFileNameWithoutExtension(p);
+                            string? appId = ExtractAppId(p);
+
+                            // Only check Start Menu if this is an explicit PWA shortcut with a Chrome/Brave app-id
+                            if (!string.IsNullOrEmpty(appId)) {
+                                string? realLnk = FindShortcutInStartMenu(appName, appId);
+                                if (!string.IsNullOrEmpty(realLnk) && System.IO.File.Exists(realLnk)) {
+                                    return realLnk;
+                                }
+                            }
+
+                            // NEVER redirect modern packaged apps (Calculator, Media Player, Store, Settings) to legacy Accessories shortcuts!
+                            return p;
                         }
                     }
                 }
@@ -854,7 +968,6 @@ namespace AppGroup {
 
             // If iconPath is not provided or invalid, check if we can get it from browser PWA User Data
             if (string.IsNullOrEmpty(iconPath) || !System.IO.File.Exists(iconPath)) {
-                string? appId = ExtractAppId(aumid);
                 if (!string.IsNullOrEmpty(appId)) {
                     string? pwaIco = FindPwaIconPath(appId);
                     if (!string.IsNullOrEmpty(pwaIco) && System.IO.File.Exists(pwaIco)) {
@@ -863,8 +976,12 @@ namespace AppGroup {
                 }
             }
 
+            string appsPath = $"shell:AppsFolder\\{aumid}";
+            string explorerExe = System.IO.Path.Combine(Environment.GetFolderPath(Environment.SpecialFolder.Windows), "explorer.exe");
+
             var shellLink = (IShellLinkW)new CShellLink();
-            shellLink.SetPath($"shell:AppsFolder\\{aumid}");
+            shellLink.SetPath(explorerExe);
+            shellLink.SetArguments(appsPath);
             shellLink.SetDescription(displayName);
             if (!string.IsNullOrEmpty(iconPath) && System.IO.File.Exists(iconPath)) {
                 shellLink.SetIconLocation(iconPath, 0);

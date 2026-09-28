@@ -160,6 +160,19 @@ namespace AppGroup {
                                 goto ExtractFresh;
                             }
 
+                            // If this is a modern packaged app (like Microsoft Store) previously cached with a monochrome/high-contrast tile,
+                            // force a clean refresh with modern IShellItemImageFactory full-color icon!
+                            if (filePath.Contains("Microsoft Store", StringComparison.OrdinalIgnoreCase) ||
+                                cached.Contains("Microsoft Store", StringComparison.OrdinalIgnoreCase)) {
+                                string storeKey = $"{cacheKey}_store_v3";
+                                if (!_iconCache.ContainsKey(storeKey)) {
+                                    _iconCache.Remove(cacheKey);
+                                    _iconCache[storeKey] = "1";
+                                    try { if (File.Exists(cached)) File.Delete(cached); } catch { }
+                                    goto ExtractFresh;
+                                }
+                            }
+
                             // If this is a Chromium PWA that was previously cached with a .lnk shell overlay (arrow),
                             // check if a clean raw PWA icon exists and re-extract once cleanly without arrow
                             if (cached.Contains(".lnk_")) {
@@ -206,6 +219,17 @@ namespace AppGroup {
                                 if (fi.Length < 1800) {
                                     _iconCache.Remove(cacheKey);
                                     goto ProceedExtract;
+                                }
+
+                                if (filePath.Contains("Microsoft Store", StringComparison.OrdinalIgnoreCase) ||
+                                    cached.Contains("Microsoft Store", StringComparison.OrdinalIgnoreCase)) {
+                                    string storeKey = $"{cacheKey}_store_v3";
+                                    if (!_iconCache.ContainsKey(storeKey)) {
+                                        _iconCache.Remove(cacheKey);
+                                        _iconCache[storeKey] = "1";
+                                        try { if (File.Exists(cached)) File.Delete(cached); } catch { }
+                                        goto ProceedExtract;
+                                    }
                                 }
 
                                 if (cached.Contains(".lnk_")) {

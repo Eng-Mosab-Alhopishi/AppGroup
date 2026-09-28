@@ -420,12 +420,21 @@
             }
 
             string extension = Path.GetExtension(targetPath).ToLowerInvariant();
-            string displayName = !string.IsNullOrWhiteSpace(friendlyName)
-                ? friendlyName
-                : Path.GetFileName(targetPath);
+            string displayName;
+            if (extension == ".lnk" || (!string.IsNullOrEmpty(friendlyName) && friendlyName.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase))) {
+                string baseName = !string.IsNullOrWhiteSpace(friendlyName)
+                    ? friendlyName
+                    : Path.GetFileName(targetPath);
 
-            if (extension == ".lnk" && !displayName.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) {
-                displayName += ".lnk";
+                if (!baseName.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) {
+                    baseName += ".lnk";
+                }
+                displayName = baseName;
+            }
+            else {
+                displayName = !string.IsNullOrWhiteSpace(friendlyName)
+                    ? friendlyName
+                    : Path.GetFileName(targetPath);
             }
 
             // Resolve DragTemp .lnk back to the real Groups path
@@ -487,6 +496,12 @@
                                     string resolvedPath = null;
                                     string displayName = item.DisplayName;
 
+                                    if (string.IsNullOrEmpty(item.Aumid) &&
+                                        (string.Equals(displayName, "Media Player", StringComparison.OrdinalIgnoreCase) ||
+                                         string.Equals(item.DisplayName, "Media Player", StringComparison.OrdinalIgnoreCase))) {
+                                        item.Aumid = "Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic";
+                                    }
+
                                     // Check if this is a packaged modern app (Store / UWP like Windows 11 Media Player)
                                     bool isPackagedApp = !string.IsNullOrEmpty(item.Aumid) &&
                                                          (item.Aumid.Contains('!') || item.Aumid.Contains("_8wekyb3d8bbwe"));
@@ -497,6 +512,10 @@
                                         resolvedPath = ShellInterop.CreateAppsFolderShortcut(item.Aumid, displayName, item.ExtractedIconPath);
                                         displayName = Path.GetFileName(resolvedPath);
                                     }
+                                    else if (item.IsFileSystem && !string.IsNullOrEmpty(item.Path)) {
+                                        resolvedPath = item.Path;
+                                        displayName = Path.GetFileName(resolvedPath);
+                                    }
                                     else {
                                         // Priority for PWAs/desktop: check if matching real .lnk exists in Start Menu
                                         string? realLnk = ShellInterop.FindShortcutInStartMenu(displayName, item.Aumid);
@@ -504,15 +523,14 @@
                                             resolvedPath = realLnk;
                                             displayName = Path.GetFileName(realLnk);
                                         }
-                                        else if (item.IsFileSystem && !string.IsNullOrEmpty(item.Path)) {
-                                            resolvedPath = item.Path;
-                                            if (string.IsNullOrEmpty(displayName))
-                                                displayName = Path.GetFileName(resolvedPath);
-                                        }
                                         else if (!string.IsNullOrEmpty(item.Aumid)) {
                                             if (string.IsNullOrEmpty(displayName))
                                                 displayName = item.Aumid.Contains('!') ? item.Aumid.Split('!')[0] : item.Aumid;
                                             resolvedPath = ShellInterop.CreateAppsFolderShortcut(item.Aumid, displayName, item.ExtractedIconPath);
+                                            displayName = Path.GetFileName(resolvedPath);
+                                        }
+                                        else if (!string.IsNullOrEmpty(item.Path) && File.Exists(item.Path)) {
+                                            resolvedPath = item.Path;
                                             displayName = Path.GetFileName(resolvedPath);
                                         }
                                     }
@@ -567,14 +585,33 @@
                                     try {
                                         var props = await file.Properties.RetrievePropertiesAsync(new[] {
                                             "System.Link.TargetParsingPath",
-                                            "System.AppUserModel.ID"
+                                            "System.AppUserModel.ID",
+                                            "System.ParsingPath"
                                         });
 
                                         props.TryGetValue("System.Link.TargetParsingPath", out var targetObj);
                                         props.TryGetValue("System.AppUserModel.ID", out var aumidObj);
+                                        props.TryGetValue("System.ParsingPath", out var parsingObj);
 
                                         string target = targetObj as string;
                                         string aumid = aumidObj as string;
+                                        string parsingPath = parsingObj as string;
+
+                                        if (string.IsNullOrEmpty(aumid) && !string.IsNullOrEmpty(parsingPath)) {
+                                            if (parsingPath.StartsWith("shell:AppsFolder\\", StringComparison.OrdinalIgnoreCase)) {
+                                                aumid = parsingPath.Substring("shell:AppsFolder\\".Length);
+                                            }
+                                            else if (parsingPath.Contains("!") || parsingPath.Contains("_8wekyb3d8bbwe")) {
+                                                int lastSlash = parsingPath.LastIndexOf('\\');
+                                                aumid = lastSlash >= 0 ? parsingPath.Substring(lastSlash + 1) : parsingPath;
+                                            }
+                                        }
+
+                                        if (string.IsNullOrEmpty(aumid) &&
+                                            (string.Equals(displayName, "Media Player", StringComparison.OrdinalIgnoreCase) ||
+                                             string.Equals(file.Name, "Media Player", StringComparison.OrdinalIgnoreCase))) {
+                                            aumid = "Microsoft.ZuneMusic_8wekyb3d8bbwe!Microsoft.ZuneMusic";
+                                        }
 
                                         bool isPackaged = !string.IsNullOrEmpty(aumid) &&
                                                           (aumid.Contains('!') || aumid.Contains("_8wekyb3d8bbwe"));
