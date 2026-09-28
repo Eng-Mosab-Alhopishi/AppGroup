@@ -422,7 +422,11 @@
             string extension = Path.GetExtension(targetPath).ToLowerInvariant();
             string displayName = !string.IsNullOrWhiteSpace(friendlyName)
                 ? friendlyName
-                : Path.GetFileNameWithoutExtension(targetPath);
+                : Path.GetFileName(targetPath);
+
+            if (extension == ".lnk" && !displayName.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) {
+                displayName += ".lnk";
+            }
 
             // Resolve DragTemp .lnk back to the real Groups path
             if (extension == ".lnk") {
@@ -483,21 +487,34 @@
                                     string resolvedPath = null;
                                     string displayName = item.DisplayName;
 
-                                    // First priority: Check if matching real .lnk exists in Start Menu
-                                    string? realLnk = ShellInterop.FindShortcutInStartMenu(displayName, item.Aumid);
-                                    if (!string.IsNullOrEmpty(realLnk) && File.Exists(realLnk)) {
-                                        resolvedPath = realLnk;
-                                        displayName = Path.GetFileNameWithoutExtension(realLnk);
-                                    }
-                                    else if (item.IsFileSystem && !string.IsNullOrEmpty(item.Path)) {
-                                        resolvedPath = item.Path;
-                                        if (string.IsNullOrEmpty(displayName))
-                                            displayName = Path.GetFileNameWithoutExtension(resolvedPath);
-                                    }
-                                    else if (!string.IsNullOrEmpty(item.Aumid)) {
+                                    // Check if this is a packaged modern app (Store / UWP like Windows 11 Media Player)
+                                    bool isPackagedApp = !string.IsNullOrEmpty(item.Aumid) &&
+                                                         (item.Aumid.Contains('!') || item.Aumid.Contains("_8wekyb3d8bbwe"));
+
+                                    if (isPackagedApp) {
                                         if (string.IsNullOrEmpty(displayName))
                                             displayName = item.Aumid.Contains('!') ? item.Aumid.Split('!')[0] : item.Aumid;
                                         resolvedPath = ShellInterop.CreateAppsFolderShortcut(item.Aumid, displayName, item.ExtractedIconPath);
+                                        displayName = Path.GetFileName(resolvedPath);
+                                    }
+                                    else {
+                                        // Priority for PWAs/desktop: check if matching real .lnk exists in Start Menu
+                                        string? realLnk = ShellInterop.FindShortcutInStartMenu(displayName, item.Aumid);
+                                        if (!string.IsNullOrEmpty(realLnk) && File.Exists(realLnk)) {
+                                            resolvedPath = realLnk;
+                                            displayName = Path.GetFileName(realLnk);
+                                        }
+                                        else if (item.IsFileSystem && !string.IsNullOrEmpty(item.Path)) {
+                                            resolvedPath = item.Path;
+                                            if (string.IsNullOrEmpty(displayName))
+                                                displayName = Path.GetFileName(resolvedPath);
+                                        }
+                                        else if (!string.IsNullOrEmpty(item.Aumid)) {
+                                            if (string.IsNullOrEmpty(displayName))
+                                                displayName = item.Aumid.Contains('!') ? item.Aumid.Split('!')[0] : item.Aumid;
+                                            resolvedPath = ShellInterop.CreateAppsFolderShortcut(item.Aumid, displayName, item.ExtractedIconPath);
+                                            displayName = Path.GetFileName(resolvedPath);
+                                        }
                                     }
 
                                     if (!string.IsNullOrEmpty(resolvedPath)) {
@@ -559,32 +576,40 @@
                                         string target = targetObj as string;
                                         string aumid = aumidObj as string;
 
-                                        // Prioritize finding real .lnk in Start Menu
-                                        string? matchingLnk = ShellInterop.FindShortcutInStartMenu(displayName, aumid);
-                                        if (!string.IsNullOrEmpty(matchingLnk) && File.Exists(matchingLnk)) {
-                                            resolvedPath = matchingLnk;
-                                            displayName = Path.GetFileNameWithoutExtension(resolvedPath);
+                                        bool isPackaged = !string.IsNullOrEmpty(aumid) &&
+                                                          (aumid.Contains('!') || aumid.Contains("_8wekyb3d8bbwe"));
+
+                                        if (isPackaged) {
+                                            resolvedPath = ShellInterop.CreateAppsFolderShortcut(aumid, displayName);
+                                            displayName = Path.GetFileName(resolvedPath);
                                         }
-                                        else if (!string.IsNullOrEmpty(target) && (File.Exists(target) || Directory.Exists(target))) {
-                                            if (target.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) {
-                                                resolvedPath = target;
+                                        else {
+                                            string? matchingLnk = ShellInterop.FindShortcutInStartMenu(displayName, aumid);
+                                            if (!string.IsNullOrEmpty(matchingLnk) && File.Exists(matchingLnk)) {
+                                                resolvedPath = matchingLnk;
+                                                displayName = Path.GetFileName(resolvedPath);
                                             }
-                                            else {
-                                                bool isBrowser = target.EndsWith("chrome.exe", StringComparison.OrdinalIgnoreCase) ||
-                                                                target.EndsWith("brave.exe", StringComparison.OrdinalIgnoreCase) ||
-                                                                target.EndsWith("msedge.exe", StringComparison.OrdinalIgnoreCase);
-                                                if (isBrowser && !string.IsNullOrEmpty(aumid)) {
-                                                    resolvedPath = ShellInterop.CreateAppsFolderShortcut(aumid, displayName);
+                                            else if (!string.IsNullOrEmpty(target) && (File.Exists(target) || Directory.Exists(target))) {
+                                                if (target.EndsWith(".lnk", StringComparison.OrdinalIgnoreCase)) {
+                                                    resolvedPath = target;
                                                 }
                                                 else {
-                                                    resolvedPath = ShellInterop.CreateFileShortcut(target, displayName);
+                                                    bool isBrowser = target.EndsWith("chrome.exe", StringComparison.OrdinalIgnoreCase) ||
+                                                                    target.EndsWith("brave.exe", StringComparison.OrdinalIgnoreCase) ||
+                                                                    target.EndsWith("msedge.exe", StringComparison.OrdinalIgnoreCase);
+                                                    if (isBrowser && !string.IsNullOrEmpty(aumid)) {
+                                                        resolvedPath = ShellInterop.CreateAppsFolderShortcut(aumid, displayName);
+                                                    }
+                                                    else {
+                                                        resolvedPath = ShellInterop.CreateFileShortcut(target, displayName);
+                                                    }
                                                 }
+                                                displayName = Path.GetFileName(resolvedPath);
                                             }
-                                            displayName = Path.GetFileNameWithoutExtension(resolvedPath);
-                                        }
-                                        else if (!string.IsNullOrEmpty(aumid)) {
-                                            resolvedPath = ShellInterop.CreateAppsFolderShortcut(aumid, displayName);
-                                            displayName = Path.GetFileNameWithoutExtension(resolvedPath);
+                                            else if (!string.IsNullOrEmpty(aumid)) {
+                                                resolvedPath = ShellInterop.CreateAppsFolderShortcut(aumid, displayName);
+                                                displayName = Path.GetFileName(resolvedPath);
+                                            }
                                         }
                                     }
                                     catch (Exception ex) {
@@ -594,7 +619,7 @@
 
                                 if (!string.IsNullOrEmpty(resolvedPath)) {
                                     if (!ExeFiles.Any(x => string.Equals(x.FilePath, resolvedPath, StringComparison.OrdinalIgnoreCase))) {
-                                        await AddAppItemAsync(resolvedPath, Path.GetFileNameWithoutExtension(displayName));
+                                        await AddAppItemAsync(resolvedPath, displayName);
                                         handled = true;
                                     }
                                 }

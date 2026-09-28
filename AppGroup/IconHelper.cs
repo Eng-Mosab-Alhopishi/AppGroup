@@ -444,20 +444,43 @@ namespace AppGroup {
                 XmlNamespaceManager nsManager = new XmlNamespaceManager(manifest.NameTable);
                 nsManager.AddNamespace("ns", "http://schemas.microsoft.com/appx/manifest/foundation/windows10");
 
-                // Get logo path from manifest
-                XmlNode logoNode = manifest.SelectSingleNode("/ns:Package/ns:Properties/ns:Logo", nsManager);
-                if (logoNode == null) return null;
+                // Prefer VisualElements logos (Square150x150Logo or Square44x44Logo) over Properties/Logo (StoreLogo)
+                XmlNode visualElements = manifest.SelectSingleNode("//*[local-name()='VisualElements']");
+                string? mainLogoPath = visualElements?.Attributes?["Square150x150Logo"]?.Value
+                                    ?? visualElements?.Attributes?["Square44x44Logo"]?.Value
+                                    ?? visualElements?.Attributes?["Logo"]?.Value;
 
-                string logoPath = logoNode.InnerText;
-                string logoDir = Path.Combine(installPath, Path.GetDirectoryName(logoPath));
+                string logoDir = installPath;
+                if (!string.IsNullOrEmpty(mainLogoPath)) {
+                    string candidate = Path.Combine(installPath, Path.GetDirectoryName(mainLogoPath));
+                    if (Directory.Exists(candidate)) logoDir = candidate;
+                }
+                else {
+                    XmlNode logoNode = manifest.SelectSingleNode("/ns:Package/ns:Properties/ns:Logo", nsManager);
+                    if (logoNode != null) {
+                        string candidate = Path.Combine(installPath, Path.GetDirectoryName(logoNode.InnerText));
+                        if (Directory.Exists(candidate)) logoDir = candidate;
+                    }
+                }
 
                 if (!Directory.Exists(logoDir)) return null;
 
                 string[] logoPatterns = new[] {
-
-    "*StoreLogo*.png",
-
-        };
+                    "*Square150x150Logo*.scale-200.png",
+                    "*Square150x150Logo*.scale-150.png",
+                    "*Square150x150Logo*.scale-100.png",
+                    "*Square150x150Logo*.png",
+                    "*Square44x44Logo*.targetsize-256*.png",
+                    "*Square44x44Logo*.targetsize-48*.png",
+                    "*Square44x44Logo*.scale-200.png",
+                    "*Square44x44Logo*.png",
+                    "*AppList*.scale-200.png",
+                    "*AppList*.png",
+                    "*Logo*.scale-200.png",
+                    "*Logo*.png",
+                    "*StoreLogo*.scale-200.png",
+                    "*StoreLogo*.png"
+                };
 
                 string highestResLogoPath = null;
                 long highestSize = 0;
@@ -476,11 +499,10 @@ namespace AppGroup {
 
                 if (string.IsNullOrEmpty(highestResLogoPath) || !File.Exists(highestResLogoPath)) return null;
 
-                // Load the image and resize/crop it to 200x200
+                // Load the image and resize/crop it to 256x256 (matching standard Jumbo icon size)
                 using (FileStream stream = new FileStream(highestResLogoPath, FileMode.Open, FileAccess.Read)) {
                     using (var originalBitmap = new Bitmap(stream)) {
-                        // Create a square bitmap of 200x200
-                        var resizedIcon = ResizeAndCropImageToSquare(originalBitmap, 200);
+                        var resizedIcon = ResizeAndCropImageToSquare(originalBitmap, 256);
                         return resizedIcon;
                     }
                 }
@@ -491,16 +513,56 @@ namespace AppGroup {
             }
         }
 
+        private static Rectangle GetNonTransparentBounds(Bitmap bmp) {
+            int minX = bmp.Width, minY = bmp.Height, maxX = -1, maxY = -1;
+            try {
+                for (int y = 0; y < bmp.Height; y++) {
+                    for (int x = 0; x < bmp.Width; x++) {
+                        if (bmp.GetPixel(x, y).A > 15) {
+                            if (x < minX) minX = x;
+                            if (x > maxX) maxX = x;
+                            if (y < minY) minY = y;
+                            if (y > maxY) maxY = y;
+                        }
+                    }
+                }
+            }
+            catch { }
+
+            if (maxX < minX || maxY < minY) {
+                return new Rectangle(0, 0, bmp.Width, bmp.Height);
+            }
+
+            int w = maxX - minX + 1;
+            int h = maxY - minY + 1;
+
+            // Only crop if content is surrounded by substantial transparent padding (< 85% width or height)
+            if (w < bmp.Width * 0.85f && h < bmp.Height * 0.85f) {
+                int padX = Math.Max(1, (int)(w * 0.05f));
+                int padY = Math.Max(1, (int)(h * 0.05f));
+                minX = Math.Max(0, minX - padX);
+                minY = Math.Max(0, minY - padY);
+                maxX = Math.Min(bmp.Width - 1, maxX + padX);
+                maxY = Math.Min(bmp.Height - 1, maxY + padY);
+                return new Rectangle(minX, minY, maxX - minX + 1, maxY - minY + 1);
+            }
+
+            return new Rectangle(0, 0, bmp.Width, bmp.Height);
+        }
+
         /// <summary>
         /// Resizes an image cleanly to fit a square canvas of the specified size, preserving full aspect ratio and transparency.
+        /// Automatically trims transparent borders so the icon content fills the tile matching master.
         /// </summary>
         private static Bitmap ResizeAndCropImageToSquare(Bitmap originalImage, int size, float zoomFactor = 1.0f) {
             try {
+                Rectangle contentBounds = GetNonTransparentBounds(originalImage);
+
                 Bitmap resizedImage = new Bitmap(size, size, System.Drawing.Imaging.PixelFormat.Format32bppArgb);
 
-                float scale = Math.Min((float)size / originalImage.Width, (float)size / originalImage.Height);
-                int drawWidth = Math.Max(1, (int)(originalImage.Width * scale));
-                int drawHeight = Math.Max(1, (int)(originalImage.Height * scale));
+                float scale = Math.Min((float)size / contentBounds.Width, (float)size / contentBounds.Height);
+                int drawWidth = Math.Max(1, (int)(contentBounds.Width * scale));
+                int drawHeight = Math.Max(1, (int)(contentBounds.Height * scale));
                 int drawX = (size - drawWidth) / 2;
                 int drawY = (size - drawHeight) / 2;
 
@@ -511,7 +573,7 @@ namespace AppGroup {
                     g.PixelOffsetMode = System.Drawing.Drawing2D.PixelOffsetMode.HighQuality;
                     g.CompositingQuality = System.Drawing.Drawing2D.CompositingQuality.HighQuality;
 
-                    g.DrawImage(originalImage, new Rectangle(drawX, drawY, drawWidth, drawHeight));
+                    g.DrawImage(originalImage, new Rectangle(drawX, drawY, drawWidth, drawHeight), contentBounds, GraphicsUnit.Pixel);
                 }
 
                 return resizedImage;

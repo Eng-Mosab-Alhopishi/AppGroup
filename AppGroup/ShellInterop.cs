@@ -397,12 +397,16 @@ namespace AppGroup {
                         }
 
                         // 5. PRIORITY: Check if this matches a real .lnk in Start Menu (Brave Apps, Chrome Apps, Edge Apps, Programs)
-                        string? foundLnk = FindShortcutInStartMenu(resolved.DisplayName, resolved.Aumid);
-                        if (!string.IsNullOrEmpty(foundLnk) && System.IO.File.Exists(foundLnk)) {
-                            resolved.IsFileSystem = true;
-                            resolved.Path = foundLnk;
-                            resolved.Aumid = null;
-                            resolved.ExtractedIconPath = null;
+                        bool isPackagedApp = !string.IsNullOrEmpty(resolved.Aumid) &&
+                                             (resolved.Aumid.Contains('!') || resolved.Aumid.Contains("_8wekyb3d8bbwe"));
+                        if (!isPackagedApp) {
+                            string? foundLnk = FindShortcutInStartMenu(resolved.DisplayName, resolved.Aumid);
+                            if (!string.IsNullOrEmpty(foundLnk) && System.IO.File.Exists(foundLnk)) {
+                                resolved.IsFileSystem = true;
+                                resolved.Path = foundLnk;
+                                resolved.Aumid = null;
+                                resolved.ExtractedIconPath = null;
+                            }
                         }
                         else if (!string.IsNullOrEmpty(linkTarget) && (System.IO.File.Exists(linkTarget) || System.IO.Directory.Exists(linkTarget))) {
                             bool isBrowserExe = linkTarget.EndsWith("chrome.exe", StringComparison.OrdinalIgnoreCase) ||
@@ -750,9 +754,7 @@ namespace AppGroup {
                     }
                 }
 
-                // 3. Scan directories safely for matching .lnk name (exact match first, then prefix/fuzzy)
-                string? prefixMatch = null;
-                string? fuzzyMatch = null;
+                // 3. Scan directories safely for EXACT matching .lnk name only
                 if (!string.IsNullOrEmpty(normTargetName)) {
                     foreach (var dir in searchDirs) {
                         if (!System.IO.Directory.Exists(dir)) continue;
@@ -763,26 +765,8 @@ namespace AppGroup {
                             if (string.Equals(fileNorm, normTargetName, StringComparison.OrdinalIgnoreCase)) {
                                 return lnk; // Exact match found!
                             }
-
-                            if (prefixMatch == null && (fileNorm.StartsWith(normTargetName, StringComparison.OrdinalIgnoreCase) ||
-                                                       normTargetName.StartsWith(fileNorm, StringComparison.OrdinalIgnoreCase))) {
-                                prefixMatch = lnk;
-                            }
-
-                            if (fuzzyMatch == null && (fileNorm.Contains(normTargetName, StringComparison.OrdinalIgnoreCase) ||
-                                                       normTargetName.Contains(fileNorm, StringComparison.OrdinalIgnoreCase))) {
-                                fuzzyMatch = lnk;
-                            }
                         }
                     }
-                }
-
-                if (!string.IsNullOrEmpty(prefixMatch) && System.IO.File.Exists(prefixMatch)) {
-                    return prefixMatch;
-                }
-
-                if (!string.IsNullOrEmpty(fuzzyMatch) && System.IO.File.Exists(fuzzyMatch)) {
-                    return fuzzyMatch;
                 }
             }
             catch (Exception ex) {
@@ -849,10 +833,16 @@ namespace AppGroup {
 
         /// <summary>Creates (or reuses) a .lnk targeting shell:AppsFolder\{aumid}, returns its path.</summary>
         public static string CreateAppsFolderShortcut(string aumid, string displayName, string iconPath = null) {
-            // Guard: If there is a real Start Menu / PWA shortcut, always prefer that over a shell:AppsFolder link!
-            string? realLnk = FindShortcutInStartMenu(displayName, aumid);
-            if (!string.IsNullOrEmpty(realLnk) && System.IO.File.Exists(realLnk)) {
-                return realLnk;
+            // Guard: Only check Start Menu if it is a Chromium PWA with a valid AppId, NEVER for packaged UWP/Store apps!
+            string? appId = ExtractAppId(aumid);
+            bool isPackagedApp = !string.IsNullOrEmpty(aumid) &&
+                                 (aumid.Contains('!') || aumid.Contains("_8wekyb3d8bbwe"));
+
+            if (!isPackagedApp && !string.IsNullOrEmpty(appId)) {
+                string? realLnk = FindShortcutInStartMenu(displayName, aumid);
+                if (!string.IsNullOrEmpty(realLnk) && System.IO.File.Exists(realLnk)) {
+                    return realLnk;
+                }
             }
 
             string folder = System.IO.Path.Combine(AppPaths.BaseDataPath, "StartAppShortcuts");
